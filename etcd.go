@@ -115,11 +115,7 @@ func (ecs *etcdConcurrencyService) run(ctx context.Context, leadershipAcquired c
 }
 
 // error means the context was cancelled
-func (ecs *etcdConcurrencyService) acquireLeadership(pctx context.Context, leadershipAcquired chan<- struct{}) error {
-	// we need a context that monitors the pctx only until we've acquired leadership
-	// we monitor the pctx until then to pass it to GRPC and other calls to abort them in the event we need to exit early
-	// but once we acquire leadership we don't want to react to pctx to avoid issues during resignation and other such calls
-	ctx, abortContextMonitoring := NewAbortableMonitoredContext(pctx)
+func (ecs *etcdConcurrencyService) acquireLeadership(ctx context.Context, leadershipAcquired chan<- struct{}) error {
 	// keep attempting leadership until successful
 	for {
 		if err := ecs.attemptLeadershipAcquisition(ctx); err != nil {
@@ -131,7 +127,6 @@ func (ecs *etcdConcurrencyService) acquireLeadership(pctx context.Context, leade
 				return fmt.Errorf("context cancelled")
 			}
 		} else {
-			abortContextMonitoring() // etcd connection should no longer track ctx
 			return nil
 		}
 	}
@@ -152,7 +147,11 @@ func (ecs *etcdConcurrencyService) releaseAndResetResources() {
 }
 
 func (ecs *etcdConcurrencyService) attemptLeadershipAcquisition(ctx context.Context) error {
-	client, err := etcd.New(etcd.Config{Endpoints: ecs.etcdEndPoints, Context: ctx})
+	// the grpc context should monitor ctx until we've managed to create a session
+	// after that we shouldn't cancel grpc connection due to context cancellation as it will interfere with proper closure
+	grpcCtx, abortGRPCCtxMonitoring := NewAbortableMonitoredContext(ctx)
+
+	client, err := etcd.New(etcd.Config{Endpoints: ecs.etcdEndPoints, Context: grpcCtx})
 	if err != nil {
 		return fmt.Errorf("error creating a new etcd client: %v", err)
 	}
@@ -163,6 +162,8 @@ func (ecs *etcdConcurrencyService) attemptLeadershipAcquisition(ctx context.Cont
 		return fmt.Errorf("error creating etcd session: %v", err)
 	}
 	ecs.session = session
+	// since we have a session and therefore a lease grpc should no longer react to ctx
+	abortGRPCCtxMonitoring()
 
 	log.Printf("App: %s. Instance: %s. Standing in election.", ecs.appPrefix, ecs.instanceName)
 	election := concurrency.NewElection(session, fmt.Sprintf("%s/leader", ecs.appPrefix))
