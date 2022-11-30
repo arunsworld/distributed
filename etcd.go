@@ -72,6 +72,7 @@ type etcdConcurrencyService struct {
 	leadershipReassurancePollingDelay   time.Duration
 	leadershipReassuranceTimeout        time.Duration
 	// internal state
+	localCtxCancellation          context.CancelFunc
 	leaderSince                   time.Time
 	leadershipReassuranceFinished chan struct{}
 	client                        *etcd.Client
@@ -82,7 +83,9 @@ type etcdConcurrencyService struct {
 func (ecs *etcdConcurrencyService) RegisterLeadershipRequest(ctx context.Context) (<-chan struct{}, <-chan error) {
 	leadershipAcquired := make(chan struct{})
 	leadershipLost := make(chan error, 1)
-	go ecs.run(ctx, leadershipAcquired, leadershipLost)
+	localCtx, localCtxCancellation := context.WithCancel(ctx)
+	ecs.localCtxCancellation = localCtxCancellation
+	go ecs.run(localCtx, leadershipAcquired, leadershipLost)
 	return leadershipAcquired, leadershipLost
 }
 
@@ -214,6 +217,7 @@ func (ecs *etcdConcurrencyService) reassureLeadership() error {
 
 func (ecs *etcdConcurrencyService) ResignLeadership(ctx context.Context) error {
 	defer ecs.releaseAndResetResources()
+	ecs.localCtxCancellation()
 	if ecs.election == nil {
 		return fmt.Errorf("error resigning: no election registered to resign from")
 	}
