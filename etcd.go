@@ -222,6 +222,10 @@ func (ecs *etcdConcurrencyService) ResignLeadership(ctx context.Context) error {
 		return fmt.Errorf("error resigning: no election registered to resign from")
 	}
 	<-ecs.leadershipReassuranceFinished // we wait until leadership assurance is finished to avoid race condition with resignation
+	// check if election resource is available again in case it got cleaned up during leadership reassurance termination
+	if ecs.election == nil {
+		return nil
+	}
 	if err := ecs.election.Resign(ctx); err != nil {
 		return err
 	}
