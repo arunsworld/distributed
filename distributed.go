@@ -16,4 +16,6 @@ type Concurrency interface {
 	// Otherwise the leadership will be locked until TTL during which there will be no leader
 	// That's why this is a separate call to give the opportunity to block until resignation is done before quiting application
 	ResignLeadership(context.Context) error
+	// Close should be called before the Concurrency entity is discarded of to free up any used resources
+	Close()
 }

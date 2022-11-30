@@ -231,3 +231,7 @@ func (ecs *etcdConcurrencyService) ResignLeadership(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (ecs *etcdConcurrencyService) Close() {
+	ecs.releaseAndResetResources()
+}
