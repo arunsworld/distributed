@@ -31,7 +31,9 @@ func NewETCDConcurrencyService(etcdEndPoints []string, appPrefix, instanceName s
 	return result
 }
 
-// if we can't connect to ETCD, how long do we wait before trying again
+// if we can't connect to etcd, how long do we wait before trying again
+// this maynot really ever get exercised and if proven will be removed
+// the reason is etcd connectivity relies on grpc which appears to keep retrying forever until context is cancelled
 func WithLeadershipAttemptRetryDelayDuration(t time.Duration) ETCDOption {
 	return func(e *etcdConcurrencyService) {
 		e.leadershipAttemptRetryDelayDuration = t
@@ -70,10 +72,11 @@ type etcdConcurrencyService struct {
 	leadershipReassurancePollingDelay   time.Duration
 	leadershipReassuranceTimeout        time.Duration
 	// internal state
-	leaderSince time.Time
-	client      *etcd.Client
-	session     *concurrency.Session
-	election    *concurrency.Election
+	leaderSince                   time.Time
+	leadershipReassuranceFinished chan struct{}
+	client                        *etcd.Client
+	session                       *concurrency.Session
+	election                      *concurrency.Election
 }
 
 func (ecs *etcdConcurrencyService) RegisterLeadershipRequest(ctx context.Context) (<-chan struct{}, <-chan error) {
@@ -88,6 +91,10 @@ func (ecs *etcdConcurrencyService) run(ctx context.Context, leadershipAcquired c
 	if err := ecs.acquireLeadership(ctx, leadershipAcquired); err != nil {
 		return
 	}
+	// leadership reassurance begins until we quit this function
+	ecs.leadershipReassuranceFinished = make(chan struct{})
+	defer close(ecs.leadershipReassuranceFinished)
+	close(leadershipAcquired)
 	// we need to then reassure leadership until it's lost or context is cancelled
 	for {
 		if err := ecs.reassureLeadership(); err != nil {
@@ -121,8 +128,7 @@ func (ecs *etcdConcurrencyService) acquireLeadership(pctx context.Context, leade
 				return fmt.Errorf("context cancelled")
 			}
 		} else {
-			close(leadershipAcquired)
-			abortContextMonitoring()
+			abortContextMonitoring() // etcd connection should no longer track ctx
 			return nil
 		}
 	}
@@ -211,6 +217,7 @@ func (ecs *etcdConcurrencyService) ResignLeadership(ctx context.Context) error {
 	if ecs.election == nil {
 		return fmt.Errorf("error resigning: no election registered to resign from")
 	}
+	<-ecs.leadershipReassuranceFinished // we wait until leadership assurance is finished to avoid race condition with resignation
 	if err := ecs.election.Resign(ctx); err != nil {
 		return err
 	}
