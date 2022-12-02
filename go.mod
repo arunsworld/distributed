@@ -2,7 +2,10 @@ module github.com/arunsworld/distributed
 
 go 1.18
 
-require go.etcd.io/etcd/client/v3 v3.5.6
+require (
+	github.com/arunsworld/nursery v0.6.0
+	go.etcd.io/etcd/client/v3 v3.5.6
+)
 
 require (
 	github.com/coreos/go-semver v0.3.0 // indirect

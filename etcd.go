@@ -2,7 +2,6 @@ package distributed
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -11,19 +10,12 @@ import (
 	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
-type ETCDOption func(*etcdConcurrencyService)
+type ETCDOption func(*etcdLeaseProvider)
 
-// appPrefix should uniquely identify the app
-// instanceName should uniquely identify the instance for the given app
-func NewETCDConcurrencyService(etcdEndPoints []string, appPrefix, instanceName string, options ...ETCDOption) Concurrency {
-	result := &etcdConcurrencyService{
-		etcdEndPoints:                       etcdEndPoints,
-		appPrefix:                           appPrefix,
-		instanceName:                        instanceName,
-		leadershipAttemptRetryDelayDuration: time.Second * 5,
-		leaseTTL:                            10,
-		leadershipReassurancePollingDelay:   time.Second * 10,
-		leadershipReassuranceTimeout:        time.Second * 5,
+func NewETCDLeaseProvider(etcdEndPoints []string, options ...ETCDOption) LeaseProvider {
+	result := &etcdLeaseProvider{
+		etcdEndPoints: etcdEndPoints,
+		leaseTTL:      10,
 	}
 	for _, o := range options {
 		o(result)
@@ -31,208 +23,108 @@ func NewETCDConcurrencyService(etcdEndPoints []string, appPrefix, instanceName s
 	return result
 }
 
-// if we can't connect to etcd, how long do we wait before trying again
-// this maynot really ever get exercised and if proven will be removed
-// the reason is etcd connectivity relies on grpc which appears to keep retrying forever until context is cancelled
-func WithLeadershipAttemptRetryDelayDuration(t time.Duration) ETCDOption {
-	return func(e *etcdConcurrencyService) {
-		e.leadershipAttemptRetryDelayDuration = t
-	}
-}
-
 // in seconds how long should ETCD wait until declaring me dead - in case I crash
 func WithLeaseTTL(t int) ETCDOption {
-	return func(e *etcdConcurrencyService) {
+	return func(e *etcdLeaseProvider) {
 		e.leaseTTL = t
 	}
 }
 
-// time between polls to ensure we are still the leader
-func WithLeadershipReassurancePollingDelay(t time.Duration) ETCDOption {
-	return func(e *etcdConcurrencyService) {
-		e.leadershipReassurancePollingDelay = t
-	}
-}
-
-// timeout when connecting to ETCD to assure leadership
-func WithLeadershipReassuranceTimeout(t time.Duration) ETCDOption {
-	return func(e *etcdConcurrencyService) {
-		e.leadershipReassuranceTimeout = t
-	}
-}
-
-type etcdConcurrencyService struct {
-	// mandatory parameters
+type etcdLeaseProvider struct {
 	etcdEndPoints []string
-	appPrefix     string
-	instanceName  string
 	// optional parameters
-	leadershipAttemptRetryDelayDuration time.Duration
-	leaseTTL                            int
-	leadershipReassurancePollingDelay   time.Duration
-	leadershipReassuranceTimeout        time.Duration
-	// internal state
-	localCtxCancellation          context.CancelFunc
-	leaderSince                   time.Time
-	leadershipReassuranceFinished chan struct{}
-	client                        *etcd.Client
-	session                       *concurrency.Session
-	election                      *concurrency.Election
+	leaseTTL int
+	// internal
+	currentLease *etcdLease
 }
 
-func (ecs *etcdConcurrencyService) RegisterLeadershipRequest(ctx context.Context) (<-chan struct{}, <-chan error) {
-	leadershipAcquired := make(chan struct{})
-	leadershipLost := make(chan error, 1)
-	localCtx, localCtxCancellation := context.WithCancel(ctx)
-	ecs.localCtxCancellation = localCtxCancellation
-	go ecs.run(localCtx, leadershipAcquired, leadershipLost)
-	return leadershipAcquired, leadershipLost
-}
-
-func (ecs *etcdConcurrencyService) run(ctx context.Context, leadershipAcquired chan<- struct{}, leadershipLost chan<- error) {
-	// error is only returned if context is cancelled; nothing further needs doing
-	if err := ecs.acquireLeadership(ctx, leadershipAcquired); err != nil {
-		return
+func (p *etcdLeaseProvider) AcquireLease(ctx context.Context) (Lease, error) {
+	if p.currentLease != nil {
+		p.currentLease.Close()
+		p.currentLease = nil
 	}
-	// leadership reassurance begins until we quit this function
-	ecs.leadershipReassuranceFinished = make(chan struct{})
-	defer close(ecs.leadershipReassuranceFinished)
-	close(leadershipAcquired)
-	// we need to then reassure leadership until it's lost or context is cancelled
+
+	actx, abortMonitoring := NewAbortableMonitoredContext(ctx)
+	var client *etcd.Client
+	var session *concurrency.Session
 	for {
-		if err := ecs.reassureLeadership(); err != nil {
-			ecs.releaseAndResetResources()
-			leadershipLost <- err
-			close(leadershipLost)
-			return
+		var err error
+		client, err = etcd.New(etcd.Config{Endpoints: p.etcdEndPoints})
+		if err != nil {
+			return nil, fmt.Errorf("error creating a new etcd client: %v", err)
+		}
+		session, err = concurrency.NewSession(client, concurrency.WithContext(actx), concurrency.WithTTL(p.leaseTTL))
+		if err == nil {
+			break
 		}
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(ecs.leadershipReassurancePollingDelay):
+			return nil, fmt.Errorf("context cancelled")
+		default:
+		}
+		log.Printf("error creating new session while attempting to aquire lease: %v", err)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled")
+		case <-time.After(time.Second):
 		}
 	}
+	abortMonitoring()
+
+	return &etcdLease{
+		client:  client,
+		session: session,
+	}, nil
 }
 
-// error means the context was cancelled
-func (ecs *etcdConcurrencyService) acquireLeadership(ctx context.Context, leadershipAcquired chan<- struct{}) error {
-	// keep attempting leadership until successful
-	for {
-		if err := ecs.attemptLeadershipAcquisition(ctx); err != nil {
-			log.Printf("App: %s. Instance: %s. Leadership acquisition transient error: %v", ecs.appPrefix, ecs.instanceName, err)
-			ecs.releaseAndResetResources()
-			select {
-			case <-time.After(ecs.leadershipAttemptRetryDelayDuration):
-			case <-ctx.Done():
-				return fmt.Errorf("context cancelled")
-			}
-		} else {
-			return nil
-		}
-	}
+type etcdLease struct {
+	client  *etcd.Client
+	session *concurrency.Session
 }
 
-func (ecs *etcdConcurrencyService) releaseAndResetResources() {
-	if ecs.election != nil {
-		ecs.election = nil
-	}
-	if ecs.session != nil {
-		ecs.session.Close()
-		ecs.session = nil
-	}
-	if ecs.client != nil {
-		ecs.client.Close()
-		ecs.client = nil
+func (l *etcdLease) Expired() <-chan struct{} {
+	return l.session.Done()
+}
+
+func (l *etcdLease) ElectionFor(constituency string) Election {
+	election := concurrency.NewElection(l.session, constituency)
+	return &etcdElection{
+		election:     election,
+		constituency: constituency,
 	}
 }
 
-func (ecs *etcdConcurrencyService) attemptLeadershipAcquisition(ctx context.Context) error {
-	// the grpc context should monitor ctx until we've managed to create a session
-	// after that we shouldn't cancel grpc connection due to context cancellation as it will interfere with proper closure
-	grpcCtx, abortGRPCCtxMonitoring := NewAbortableMonitoredContext(ctx)
+func (l *etcdLease) Close() {
+	if err := l.session.Close(); err != nil {
+		log.Printf("warning: error closing session: %v", err)
+	}
+	if err := l.client.Close(); err != nil {
+		log.Printf("warning: error closing client: %v", err)
+	}
+}
 
-	client, err := etcd.New(etcd.Config{Endpoints: ecs.etcdEndPoints, Context: grpcCtx})
-	if err != nil {
-		return fmt.Errorf("error creating a new etcd client: %v", err)
-	}
-	ecs.client = client
+type etcdElection struct {
+	election     *concurrency.Election
+	constituency string
+}
 
-	session, err := concurrency.NewSession(client, concurrency.WithContext(ctx), concurrency.WithTTL(ecs.leaseTTL))
-	if err != nil {
-		return fmt.Errorf("error creating etcd session: %v", err)
-	}
-	ecs.session = session
-	// since we have a session and therefore a lease grpc should no longer react to ctx
-	abortGRPCCtxMonitoring()
-
-	log.Printf("App: %s. Instance: %s. Standing in election.", ecs.appPrefix, ecs.instanceName)
-	election := concurrency.NewElection(session, fmt.Sprintf("%s/leader", ecs.appPrefix))
-	data := struct {
-		Instance               string
-		SeekingLeadershipSince time.Time
-	}{
-		Instance:               ecs.instanceName,
-		SeekingLeadershipSince: time.Now(),
-	}
-	val, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("error marshalling value in preparing for election: %v", err)
-	}
-	if err := election.Campaign(ctx, string(val)); err != nil {
-		return fmt.Errorf("error campaigning in election: %v", err)
-	}
-	ecs.election = election
-	ecs.leaderSince = time.Now()
-
-	// we have won the campaign (apparently)
-	// since it might have been a long while we should reassure leadership
-	if err := ecs.reassureLeadership(); err != nil {
-		return err
+func (e *etcdElection) Campaign(ctx context.Context, val string) error {
+	if err := e.election.Campaign(ctx, val); err != nil {
+		return fmt.Errorf("error campaigning in %s election: %v", e.constituency, err)
 	}
 	return nil
 }
 
-func (ecs *etcdConcurrencyService) reassureLeadership() error {
-	ctx, cancel := context.WithTimeout(context.Background(), ecs.leadershipReassuranceTimeout)
-	defer cancel()
-
-	data := struct {
-		Instance    string
-		LeaderSince time.Time
-		LastSeen    time.Time
-	}{
-		Instance:    ecs.instanceName,
-		LeaderSince: ecs.leaderSince,
-		LastSeen:    time.Now(),
-	}
-
-	val, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("error marshalling proclamation data: %v", err)
-	}
-	if err := ecs.election.Proclaim(ctx, string(val)); err != nil {
-		return fmt.Errorf("error confirming leadership: %v", err)
+func (e *etcdElection) ReassureLeadership(ctx context.Context, val string) error {
+	if err := e.election.Proclaim(ctx, val); err != nil {
+		return fmt.Errorf("error reassuring leadership for %s: %v", e.constituency, err)
 	}
 	return nil
 }
 
-func (ecs *etcdConcurrencyService) ResignLeadership(ctx context.Context) error {
-	defer ecs.releaseAndResetResources()
-	ecs.localCtxCancellation()
-	if ecs.election == nil {
-		return fmt.Errorf("error resigning: no election registered to resign from")
-	}
-	<-ecs.leadershipReassuranceFinished // we wait until leadership assurance is finished to avoid race condition with resignation
-	// check if election resource is available again in case it got cleaned up during leadership reassurance termination
-	if ecs.election == nil {
-		return nil
-	}
-	if err := ecs.election.Resign(ctx); err != nil {
-		return err
+func (e *etcdElection) Resign(ctx context.Context) error {
+	if err := e.election.Resign(ctx); err != nil {
+		return fmt.Errorf("error resigning leadership for %s: %v", e.constituency, err)
 	}
 	return nil
-}
-
-func (ecs *etcdConcurrencyService) Close() {
-	ecs.releaseAndResetResources()
 }
