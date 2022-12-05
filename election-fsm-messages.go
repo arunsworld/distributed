@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type electionFSMMsg struct {
@@ -16,7 +18,8 @@ type electionFSMMsgType uint8
 
 const (
 	registerLeaseMsgType electionFSMMsgType = iota
-	electionCampaignFailed
+	electionCampaignFailedMsgType
+	electionCampaignRetryMsgType
 	electedLeaderMsgType
 	captureLeaseLostMsgType
 	resignMsgType
@@ -25,8 +28,10 @@ const (
 
 func (e electionFSMMsgType) String() string {
 	switch e {
-	case electionCampaignFailed:
+	case electionCampaignFailedMsgType:
 		return "Election Campaign Failed"
+	case electionCampaignRetryMsgType:
+		return "Election Campaign Retry"
 	case electedLeaderMsgType:
 		return "Elected Leader"
 	case captureLeaseLostMsgType:
@@ -45,6 +50,15 @@ type registerLeaseMsg struct {
 	resp  chan<- struct{}
 }
 
+type campaignFailedMsg struct {
+	leaseID string
+	err     error
+}
+
+type campaignRetryMsg struct {
+	leaseID string
+}
+
 type electedLeaderMsg struct {
 	electedAt time.Time
 	election  Election
@@ -61,16 +75,50 @@ type resignationRespMsg struct {
 }
 
 func (efsm *electionFSM) processElection(lease Lease) {
-	if efsm.electionState != notACandidate {
-		log.Printf("WARNING: asked to process election for constituency: %s but we've already entered into an election", efsm.emdp.constituency(efsm.shard))
-		return
-	}
+	efsm.electionState = electionCampaignInProgress
+	leaseID := uuid.New().String()
+	efsm.currentLeaseID = leaseID
+	efsm.currentLease = lease
 	ctx, cancel := context.WithCancel(context.Background())
 	efsm.cancelElectionInProgress = cancel
-	go campaignForLeadership(ctx, efsm.shard, efsm.emdp, lease, efsm.mailbox)
+	go campaignForLeadership(ctx, efsm.shard, efsm.emdp, lease, leaseID, efsm.mailbox)
 }
 
-func (efsm *electionFSM) processLeaseLost() bool {
+func (efsm *electionFSM) processFailedCampaign(leaseID string, err error) {
+	if !(efsm.electionState == electionCampaignInProgress || efsm.electionState == electionCampaignFailed) {
+		log.Printf("WARNING: got message of old campaign (wrong state) failing for: %s: %v", efsm.emdp.constituency(efsm.shard), err)
+		return
+	}
+	if leaseID != efsm.currentLeaseID {
+		log.Printf("WARNING: got message of old campaign (because lease ID didn't match) failing for: %s: %v", efsm.emdp.constituency(efsm.shard), err)
+		return
+	}
+	log.Printf("warning: campaign for %s failed: %v", efsm.emdp.constituency(efsm.shard), err)
+	efsm.electionState = electionCampaignFailed
+	go func() {
+		<-time.After(time.Second)
+		efsm.mailbox <- electionFSMMsg{
+			msgType: electionCampaignRetryMsgType,
+			payload: campaignRetryMsg{
+				leaseID: leaseID,
+			},
+		}
+	}()
+}
+
+func (efsm *electionFSM) processCampaignRetry(leaseID string) {
+	if efsm.electionState != electionCampaignFailed {
+		log.Printf("will not retry failed election campaign since we're not in a failed campaign but in: %s", efsm.electionState.String())
+		return
+	}
+	if efsm.currentLeaseID != leaseID {
+		log.Println("asked to retry stale election, ignoring")
+		return
+	}
+	efsm.processElection(efsm.currentLease)
+}
+
+func (efsm *electionFSM) processLeaseLostAndQuit() bool {
 	switch efsm.electionState {
 	case electedLeader:
 		efsm.leadershipLost <- fmt.Errorf("lease lost")
@@ -78,7 +126,7 @@ func (efsm *electionFSM) processLeaseLost() bool {
 	case electionCampaignInProgress:
 		efsm.cancelElectionInProgress()
 		return false
-	case notACandidate:
+	case noLeaseForElection:
 		log.Printf("WARNING: Shard: %s received lease lost but it wasn't even a candidate", efsm.shard)
 		return false
 	}
@@ -98,15 +146,19 @@ func (efsm *electionFSM) processClose() {
 	}
 }
 
-func campaignForLeadership(ctx context.Context, shard string, emdp electionMetaDataProvider, lease Lease, mailbox chan electionFSMMsg) {
+func campaignForLeadership(ctx context.Context, shard string, emdp electionMetaDataProvider, lease Lease, leaseID string, mailbox chan electionFSMMsg) {
 	election := lease.ElectionFor(emdp.constituency(shard))
 	if err := election.Campaign(ctx, emdp.campaignPromise()); err != nil {
 		select {
 		case <-ctx.Done():
+			log.Printf("campaign for leadership for: %s cancelled", emdp.constituency(shard))
 		default:
 			mailbox <- electionFSMMsg{
-				msgType: electionCampaignFailed,
-				payload: fmt.Errorf("error campaigning in election: %v", err),
+				msgType: electionCampaignFailedMsgType,
+				payload: campaignFailedMsg{
+					leaseID: leaseID,
+					err:     fmt.Errorf("error campaigning in election: %v", err),
+				},
 			}
 		}
 		return
@@ -114,8 +166,11 @@ func campaignForLeadership(ctx context.Context, shard string, emdp electionMetaD
 	electedAt := time.Now()
 	if err := reassureLeadership(ctx, emdp, electedAt, election); err != nil {
 		mailbox <- electionFSMMsg{
-			msgType: electionCampaignFailed,
-			payload: err,
+			msgType: electionCampaignFailedMsgType,
+			payload: campaignFailedMsg{
+				leaseID: leaseID,
+				err:     fmt.Errorf("error reassuring leadership while campaigning in election: %v", err),
+			},
 		}
 		return
 	}

@@ -27,6 +27,8 @@ type electionFSM struct {
 	// mailbox
 	mailbox chan electionFSMMsg
 	// internal state
+	currentLeaseID           string
+	currentLease             Lease
 	electionState            electionState
 	cancelElectionInProgress context.CancelFunc
 	electedLeaderAt          time.Time
@@ -36,8 +38,9 @@ type electionFSM struct {
 type electionState uint8
 
 const (
-	notACandidate electionState = iota
+	noLeaseForElection electionState = iota
 	electionCampaignInProgress
+	electionCampaignFailed
 	electedLeader
 )
 
@@ -45,10 +48,12 @@ func (e electionState) String() string {
 	switch e {
 	case electionCampaignInProgress:
 		return "Campaign in Progress"
+	case electionCampaignFailed:
+		return "Campaign Failed"
 	case electedLeader:
 		return "Elected Leader"
 	default:
-		return "Not A Candidate"
+		return "No Lease for Election"
 	}
 }
 
@@ -62,15 +67,19 @@ func (efsm *electionFSM) run() {
 		startingState := efsm.electionState
 		switch msg.msgType {
 		case registerLeaseMsgType:
+			if efsm.electionState != noLeaseForElection {
+				log.Printf("WARNING: asked to process election for constituency: %s but we already have a lease", efsm.emdp.constituency(efsm.shard))
+				return
+			}
 			req := msg.payload.(registerLeaseMsg)
 			efsm.processElection(req.lease)
-			efsm.electionState = electionCampaignInProgress
 			close(req.resp)
-		case electionCampaignFailed:
-			// this is like a NOOP - we should never get this - but if we do they are just errant messages that can be ignored
-			// no change to state model beause of this
-			err := msg.payload.(error)
-			log.Printf("WARNING: campaign failed for: %s: %v", efsm.emdp.constituency(efsm.shard), err)
+		case electionCampaignFailedMsgType:
+			msg := msg.payload.(campaignFailedMsg)
+			efsm.processFailedCampaign(msg.leaseID, msg.err)
+		case electionCampaignRetryMsgType:
+			msg := msg.payload.(campaignRetryMsg)
+			efsm.processCampaignRetry(msg.leaseID)
 		case electedLeaderMsgType:
 			if efsm.electionState != electionCampaignInProgress {
 				log.Printf("WARNING: leadership election message received when campaign not in progress. Ignorning.")
@@ -82,11 +91,12 @@ func (efsm *electionFSM) run() {
 			efsm.electionState = electedLeader
 			close(efsm.leadershipAcquired)
 		case captureLeaseLostMsgType:
-			if efsm.processLeaseLost() {
+			if efsm.processLeaseLostAndQuit() {
 				msg.payload.(chan bool) <- true
 				return
 			} else {
-				efsm.electionState = notACandidate
+				efsm.currentLeaseID = ""
+				efsm.electionState = noLeaseForElection
 				msg.payload.(chan bool) <- false
 			}
 		case resignMsgType:

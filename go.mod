@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/arunsworld/nursery v0.6.0
+	github.com/google/uuid v1.1.2
 	go.etcd.io/etcd/client/v3 v3.5.6
 )
 
