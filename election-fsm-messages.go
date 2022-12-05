@@ -89,7 +89,9 @@ func (efsm *electionFSM) processClose() {
 	switch efsm.electionState {
 	case electedLeader:
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		efsm.election.Resign(ctx)
+		if err := efsm.election.Resign(ctx); err != nil {
+			log.Printf("WARNING: error when resigning during close: %v", err)
+		}
 		cancel()
 	case electionCampaignInProgress:
 		efsm.cancelElectionInProgress()

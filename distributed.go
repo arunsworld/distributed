@@ -78,7 +78,6 @@ func (c *Concurrency) Close() {
 		payload: resp,
 	}
 	<-resp
-	return
 }
 
 type emdpProvidier struct {
