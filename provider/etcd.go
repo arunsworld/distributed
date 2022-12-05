@@ -1,4 +1,4 @@
-package distributed
+package provider
 
 import (
 	"context"

@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/arunsworld/distributed/provider"
 	"github.com/arunsworld/nursery"
 )
 
@@ -16,7 +17,7 @@ type Job struct {
 
 type ProcessorOpt func(*LeadershipBasedJobProcessor)
 
-func NewLeadershipBasedJobProcessor(appName, instanceName string, leaseProvider LeaseProvider, jobs []Job, opts ...ProcessorOpt) *LeadershipBasedJobProcessor {
+func NewLeadershipBasedJobProcessor(appName, instanceName string, leaseProvider provider.LeaseProvider, jobs []Job, opts ...ProcessorOpt) *LeadershipBasedJobProcessor {
 	result := &LeadershipBasedJobProcessor{
 		appName:       appName,
 		instanceName:  instanceName,
@@ -32,7 +33,7 @@ func NewLeadershipBasedJobProcessor(appName, instanceName string, leaseProvider 
 type LeadershipBasedJobProcessor struct {
 	appName       string
 	instanceName  string
-	leaseProvider LeaseProvider
+	leaseProvider provider.LeaseProvider
 	jobs          []Job
 	// optional
 	blockOnNoJobs    bool

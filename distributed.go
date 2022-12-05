@@ -5,34 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/arunsworld/distributed/fsm"
+	"github.com/arunsworld/distributed/provider"
 )
 
-type LeaseProvider interface {
-	// if context is cancelled, return an error; otherwise expected to block forever until lease is acquired
-	AcquireLease(context.Context) (Lease, error)
-}
-
-type Lease interface {
-	Expired() <-chan struct{}
-	ElectionFor(constituency string) Election
-	Close()
-}
-
-type Election interface {
-	Campaign(context.Context, string) error
-	ReassureLeadership(context.Context, string) error
-	Resign(context.Context) error
-}
-
-func NewConcurrency(appName, instanceName string, leaseProvider LeaseProvider) *Concurrency {
+func NewConcurrency(appName, instanceName string, leaseProvider provider.LeaseProvider) *Concurrency {
 	emdpProvidier := emdpProvidier{appName: appName, instanceName: instanceName}
 	return &Concurrency{
-		leaseFSM: newLeaseFSM(leaseProvider, emdpProvidier),
+		leaseFSM: fsm.NewLeaseFSM(leaseProvider, emdpProvidier),
 	}
 }
 
 type Concurrency struct {
-	leaseFSM *leaseFSM
+	leaseFSM fsm.LeaseFSM
 }
 
 // RegisterLeadershipRequest registers the caller for a leadership election. Returns 2 channels.
@@ -42,41 +28,25 @@ type Concurrency struct {
 // lostLeadership receives a callback if leadership is subsequently lost after leadership acquisition
 // the included error indicates why the leadership was lost
 func (c *Concurrency) RegisterLeadershipRequest(shard string) (<-chan struct{}, <-chan error, error) {
-	_resp := make(chan leadershipRegistrationResp)
-	c.leaseFSM.mailbox <- leaseFSMMsg{
-		msgType: leadershipRegistrationReqMsgType,
-		payload: leadershipRegistrationReq{
-			shard: shard,
-			resp:  _resp,
-		},
-	}
+	msg, _resp := fsm.NewLeadershipRegistrationReq(shard)
+	c.leaseFSM.Publish(msg)
 	resp := <-_resp
-	return resp.leadershipAcquired, resp.leadershipLost, resp.err
+	return resp.LeadershipAcquired(), resp.LeadershipLost(), resp.Err()
 }
 
 // A good citizen should always call ResignLeadership before quiting
 // Otherwise the leadership will be locked until TTL during which there will be no leader
 // That's why this is a separate call to give the opportunity to block until resignation is done before quiting application
 func (c *Concurrency) ResignLeadership(ctx context.Context, shard string) error {
-	resp := make(chan error)
-	c.leaseFSM.mailbox <- leaseFSMMsg{
-		msgType: leadershipResignationReqMsgType,
-		payload: leadershipResignationReq{
-			ctx:   ctx,
-			shard: shard,
-			resp:  resp,
-		},
-	}
+	msg, resp := fsm.NewLeadershipResignationReq(ctx, shard)
+	c.leaseFSM.Publish(msg)
 	return <-resp
 }
 
 // Close should be called before the Concurrency entity is discarded of to free up any used resources
 func (c *Concurrency) Close() {
-	resp := make(chan struct{})
-	c.leaseFSM.mailbox <- leaseFSMMsg{
-		msgType: leaseFSMCloseMsgType,
-		payload: resp,
-	}
+	msg, resp := fsm.NewLeaseCloseMsg()
+	c.leaseFSM.Publish(msg)
 	<-resp
 }
 
@@ -85,11 +55,11 @@ type emdpProvidier struct {
 	instanceName string
 }
 
-func (e emdpProvidier) constituency(shard string) string {
+func (e emdpProvidier) Constituency(shard string) string {
 	return fmt.Sprintf("%s/%s/leader", e.appName, shard)
 }
 
-func (e emdpProvidier) campaignPromise() string {
+func (e emdpProvidier) CampaignPromise() string {
 	data := struct {
 		Instance               string
 		SeekingLeadershipSince time.Time
@@ -104,7 +74,7 @@ func (e emdpProvidier) campaignPromise() string {
 	return string(val)
 }
 
-func (e emdpProvidier) leadershipReassurance(electedAt time.Time) string {
+func (e emdpProvidier) LeadershipReassurance(electedAt time.Time) string {
 	data := struct {
 		Instance    string
 		LeaderSince time.Time

@@ -8,35 +8,8 @@ import (
 	"time"
 
 	"github.com/arunsworld/distributed"
+	"github.com/arunsworld/distributed/provider"
 )
-
-func Test_AbortableContextMonitor(t *testing.T) {
-	t.Run("monitors the given context and cancels the returned context when done", func(t *testing.T) {
-		// Given
-		pCtx, pCtxCancel := context.WithCancel(context.Background())
-		ctx, _ := distributed.NewAbortableMonitoredContext(pCtx)
-		// When: now we cancel the parent context
-		pCtxCancel()
-		// Then
-		<-ctx.Done()
-	})
-	t.Run("aborts monitoring when asked ignoring the parent context afterwards", func(t *testing.T) {
-		// Given
-		pCtx, pCtxCancel := context.WithCancel(context.Background())
-		ctx, acm := distributed.NewAbortableMonitoredContext(pCtx)
-		// When: now we abort monitoring the parent context
-		acm()
-		// and then cancel the parent context
-		pCtxCancel()
-		// Then
-		time.Sleep(time.Millisecond * 10)
-		select {
-		case <-ctx.Done():
-			t.Fatal("monitored context was cancelled after abort...fail")
-		default:
-		}
-	})
-}
 
 func Test_NewConcurrency(t *testing.T) {
 	t.Run("acquires only one lease across multiple registration requests", func(t *testing.T) {
@@ -200,7 +173,7 @@ type testLeaseProvider struct {
 	electionErrorUntil   int
 }
 
-func (p *testLeaseProvider) AcquireLease(ctx context.Context) (distributed.Lease, error) {
+func (p *testLeaseProvider) AcquireLease(ctx context.Context) (provider.Lease, error) {
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("conext cancelled")
@@ -241,7 +214,7 @@ func (l *testLease) Expired() <-chan struct{} {
 	return l.done
 }
 
-func (l *testLease) ElectionFor(constituency string) distributed.Election {
+func (l *testLease) ElectionFor(constituency string) provider.Election {
 	var electionErr error
 	if l.electionErrorUntil > 0 {
 		if l.errorCount < l.electionErrorUntil {
