@@ -61,7 +61,7 @@ func (lsfm *leaseFSM) run() {
 			go lsfm.lease.Close() // Note: this takes TTL seconds. Hence putting into background.
 			lsfm.lease = nil
 			lsfm.leaseState = noLease
-			lsfm.mailbox <- leaseFSMMsg{msgType: leaseCreationReqMsgType}
+			go lsfm.Publish(NewLeaseCreationReq())
 		case leadershipResignationReqMsgType:
 			req := msg.leadershipResignationReq
 			req.resp <- lsfm.resignLeadership(req.ctx, req.shard)
@@ -83,17 +83,17 @@ func (lsfm *leaseFSM) processLeadershipRegistrationReq(shard string) leadershipR
 	}
 	leadershipAcquired := make(chan struct{})
 	leadershipLost := make(chan error, 1)
-	lsfm.shards[shard] = NewElectionFSM(shard, leadershipAcquired, leadershipLost, lsfm.emdp)
+	electionFSM := NewElectionFSM(shard, leadershipAcquired, leadershipLost, lsfm.emdp)
+	lsfm.shards[shard] = electionFSM
 
 	switch lsfm.leaseState {
 	case noLease:
-		select {
-		case lsfm.mailbox <- leaseFSMMsg{msgType: leaseCreationReqMsgType}:
-		default:
-		}
+		// in case the queue to publish messages is filled by registration requests, we shouldn't block in our attempt to publish
+		// a lease creation request
+		go lsfm.Publish(NewLeaseCreationReq())
 	case leaseAcquired:
 		msg, resp := NewRegisterLeaseMessage(lsfm.lease)
-		lsfm.shards[shard].Publish(msg)
+		electionFSM.Publish(msg)
 		<-resp
 	}
 

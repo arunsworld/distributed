@@ -3,12 +3,14 @@ package distributed_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/arunsworld/distributed"
 	"github.com/arunsworld/distributed/provider"
+	"github.com/google/uuid"
 )
 
 func Test_NewConcurrency(t *testing.T) {
@@ -162,6 +164,25 @@ func Test_NewConcurrency(t *testing.T) {
 		// Then the failed campaign retry does not interfere and we acquire leadership with the right lease
 		<-leadershipAcquired
 	})
+	t.Run("able to register hundreds of jobs even when lease acquisition takes time", func(t *testing.T) {
+		// Given
+		leaseCreationTrigger := make(chan struct{})
+		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger}
+		c := distributed.NewConcurrency("testApp", "node1", provider)
+		// When
+		wg := sync.WaitGroup{}
+		for i := 0; i < 500; i++ {
+			wg.Add(1)
+			go func(i int) {
+				_, _, err := c.RegisterLeadershipRequest(fmt.Sprintf("job-%d", i))
+				if err != nil {
+					panic(err)
+				}
+				wg.Done()
+			}(i)
+		}
+		wg.Wait()
+	})
 }
 
 type testLeaseProvider struct {
@@ -190,6 +211,7 @@ func (p *testLeaseProvider) calledCount() int {
 
 func newTestLease(leaseTimeoutTrigger chan struct{}, campaignTrigger chan struct{}, electionErrorUntil int) *testLease {
 	result := &testLease{
+		id:                 uuid.New().String(),
 		done:               make(chan struct{}),
 		electionErrorUntil: electionErrorUntil,
 		campaignTrigger:    campaignTrigger,
@@ -202,12 +224,17 @@ func newTestLease(leaseTimeoutTrigger chan struct{}, campaignTrigger chan struct
 }
 
 type testLease struct {
+	id                 string
 	done               chan struct{}
 	elections          []*election
 	leaseClosed        bool
 	campaignTrigger    chan struct{}
 	electionErrorUntil int
 	errorCount         int
+}
+
+func (l *testLease) ID() string {
+	return l.id
 }
 
 func (l *testLease) Expired() <-chan struct{} {

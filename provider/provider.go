@@ -11,6 +11,7 @@ type LeaseProvider interface {
 }
 
 type Lease interface {
+	ID() string
 	Expired() <-chan struct{}
 	ElectionFor(constituency string) Election
 	Close()

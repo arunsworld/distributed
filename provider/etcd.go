@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	etcd "go.etcd.io/etcd/client/v3"
@@ -16,6 +17,7 @@ func NewETCDLeaseProvider(etcdEndPoints []string, options ...ETCDOption) LeasePr
 	result := &etcdLeaseProvider{
 		etcdEndPoints: etcdEndPoints,
 		leaseTTL:      10,
+		config:        etcd.Config{Endpoints: etcdEndPoints},
 	}
 	for _, o := range options {
 		o(result)
@@ -30,11 +32,25 @@ func WithLeaseTTL(t int) ETCDOption {
 	}
 }
 
+func WithUsernamePassword(username, password string) ETCDOption {
+	return func(e *etcdLeaseProvider) {
+		e.config.Username = username
+		e.config.Password = password
+	}
+}
+
+func WithETCDConfig(config etcd.Config) ETCDOption {
+	return func(e *etcdLeaseProvider) {
+		e.config = config
+	}
+}
+
 type etcdLeaseProvider struct {
 	etcdEndPoints []string
 	// optional parameters
 	leaseTTL int
 	// internal
+	config       etcd.Config
 	currentLease *etcdLease
 }
 
@@ -49,7 +65,7 @@ func (p *etcdLeaseProvider) AcquireLease(ctx context.Context) (Lease, error) {
 	var session *concurrency.Session
 	for {
 		var err error
-		client, err = etcd.New(etcd.Config{Endpoints: p.etcdEndPoints})
+		client, err = etcd.New(p.config)
 		if err != nil {
 			return nil, fmt.Errorf("error creating a new etcd client: %v", err)
 		}
@@ -80,6 +96,13 @@ func (p *etcdLeaseProvider) AcquireLease(ctx context.Context) (Lease, error) {
 type etcdLease struct {
 	client  *etcd.Client
 	session *concurrency.Session
+}
+
+func (l *etcdLease) ID() string {
+	if l.session == nil {
+		return ""
+	}
+	return strconv.FormatInt(int64(l.session.Lease()), 10)
 }
 
 func (l *etcdLease) Expired() <-chan struct{} {
