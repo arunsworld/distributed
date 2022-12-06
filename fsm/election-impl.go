@@ -75,9 +75,8 @@ func (efsm *electionFSM) run() {
 				log.Printf("WARNING: leadership election message received when campaign not in progress. Ignorning.")
 				continue
 			}
-			electionMsg := msg.electedLeaderMsg
-			efsm.electedLeaderAt = electionMsg.electedAt
-			efsm.election = electionMsg.election
+			efsm.electedLeaderAt = msg.electedLeaderMsg.electedAt
+			efsm.election = msg.electedLeaderMsg.election
 			efsm.electionState = electedLeader
 			close(efsm.leadershipAcquired)
 		case captureLeaseLostMsgType:
@@ -111,7 +110,7 @@ func (efsm *electionFSM) processElection(lease provider.Lease) {
 	efsm.currentLease = lease
 	ctx, cancel := context.WithCancel(context.Background())
 	efsm.cancelElectionInProgress = cancel
-	go campaignForLeadership(ctx, efsm.shard, efsm.emdp, lease, efsm)
+	go campaignForLeadership(ctx, efsm.shard, efsm.emdp, lease, efsm.Publish)
 }
 
 func (efsm *electionFSM) processFailedCampaign(leaseID string, err error) {
@@ -125,10 +124,11 @@ func (efsm *electionFSM) processFailedCampaign(leaseID string, err error) {
 	}
 	log.Printf("warning: campaign for %s failed: %v", efsm.emdp.Constituency(efsm.shard), err)
 	efsm.electionState = electionCampaignFailed
-	go func() {
+	// publish a retry after a delay - currently the delay is hardcoded to 1s - does it need to be configurable?
+	go func(publish func(electionFSMMsg), leaseID string) {
 		<-time.After(time.Second)
-		efsm.Publish(NewElectionCampaignRetryMsg(leaseID))
-	}()
+		publish(NewElectionCampaignRetryMsg(leaseID))
+	}(efsm.Publish, leaseID)
 }
 
 func (efsm *electionFSM) processCampaignRetry(leaseID string) {
@@ -171,23 +171,23 @@ func (efsm *electionFSM) processClose() {
 	}
 }
 
-func campaignForLeadership(ctx context.Context, shard string, emdp provider.ElectionMetaDataProvider, lease provider.Lease, efsm ElectionFSM) {
+func campaignForLeadership(ctx context.Context, shard string, emdp provider.ElectionMetaDataProvider, lease provider.Lease, publish func(electionFSMMsg)) {
 	election := lease.ElectionFor(emdp.Constituency(shard))
 	if err := election.Campaign(ctx, emdp.CampaignPromise()); err != nil {
 		select {
 		case <-ctx.Done():
 			log.Printf("campaign for leadership for: %s cancelled", emdp.Constituency(shard))
 		default:
-			efsm.Publish(NewCampaignFailedMsg(lease.ID(), fmt.Errorf("error campaigning in election: %v", err)))
+			publish(NewCampaignFailedMsg(lease.ID(), fmt.Errorf("error campaigning in election: %v", err)))
 		}
 		return
 	}
 	electedAt := time.Now()
 	if err := reassureLeadership(ctx, emdp, electedAt, election); err != nil {
-		efsm.Publish(NewCampaignFailedMsg(lease.ID(), fmt.Errorf("error reassuring leadership while campaigning in election: %v", err)))
+		publish(NewCampaignFailedMsg(lease.ID(), fmt.Errorf("error reassuring leadership while campaigning in election: %v", err)))
 		return
 	}
-	efsm.Publish(NewElectedLeaderMsg(electedAt, election))
+	publish(NewElectedLeaderMsg(electedAt, election))
 }
 
 func reassureLeadership(ctx context.Context, emdp provider.ElectionMetaDataProvider, electedAt time.Time, election provider.Election) error {

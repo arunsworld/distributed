@@ -82,7 +82,7 @@ func (lsfm *leaseFSM) processLeadershipRegistrationReq(shard string) leadershipR
 		}
 	}
 	leadershipAcquired := make(chan struct{})
-	leadershipLost := make(chan error, 1)
+	leadershipLost := make(chan error, 1) // add some buffer in case caller doesn't read this channel
 	electionFSM := NewElectionFSM(shard, leadershipAcquired, leadershipLost, lsfm.emdp)
 	lsfm.shards[shard] = electionFSM
 
@@ -110,7 +110,7 @@ func (lsfm *leaseFSM) processLeaseCreationReq() {
 	lsfm.leaseState = acquiringLease
 	ctx, cancel := context.WithCancel(context.Background())
 	lsfm.cancelLeaseAquisition = cancel
-	go acquireLease(ctx, lsfm.provider, lsfm)
+	go acquireLease(ctx, lsfm.provider, lsfm.Publish)
 }
 
 func (lsfm *leaseFSM) activateShards() {
@@ -165,7 +165,7 @@ func (lsfm *leaseFSM) processClose() {
 	lsfm.lease.Close()
 }
 
-func acquireLease(ctx context.Context, provider provider.LeaseProvider, lsfm LeaseFSM) {
+func acquireLease(ctx context.Context, provider provider.LeaseProvider, publish func(leaseFSMMsg)) {
 	lease, err := provider.AcquireLease(ctx)
 	if err != nil {
 		select {
@@ -175,9 +175,9 @@ func acquireLease(ctx context.Context, provider provider.LeaseProvider, lsfm Lea
 		}
 		return
 	}
-	lsfm.Publish(NewLeaseCreated(lease))
+	publish(NewLeaseCreated(lease))
 
 	<-lease.Expired()
 
-	lsfm.Publish(NewLeaseLost())
+	publish(NewLeaseLost())
 }
