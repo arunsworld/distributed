@@ -6,15 +6,21 @@ import (
 	"github.com/arunsworld/distributed/provider"
 )
 
+// LeaseFSM provides a variety of functionality in a concurrent safe way using the concept of a state model and actor model
+// It receives leadership registration requests from it's end users upon which it ensures the acquisition of a lease
+// and subsequent delegation of leadership election to ElectionFSM.
+// It also processes requests for when this election is obtained if a max leadership quota is confirmed.
+// It handles resignations by delegating it down and loss of leases.
 type LeaseFSM interface {
 	Publish(leaseFSMMsg)
 }
 
-func NewLeaseFSM(provider provider.LeaseProvider, emdp provider.ElectionMetaDataProvider) *leaseFSM {
+func NewLeaseFSM(provider provider.LeaseProvider, emdp provider.ElectionMetaDataProvider, maxLeaders int) *leaseFSM {
 	result := &leaseFSM{
-		provider: provider,
-		emdp:     emdp,
-		mailbox:  make(chan leaseFSMMsg, 30),
+		provider:   provider,
+		emdp:       emdp,
+		mailbox:    make(chan leaseFSMMsg, 30),
+		maxLeaders: maxLeaders,
 	}
 	go result.run()
 	return result
@@ -78,13 +84,26 @@ func NewLeaseCloseMsg() (leaseFSMMsg, <-chan struct{}) {
 	}, resp
 }
 
+func NewConfirmationReqOnceLeader(shard string) leaseFSMMsg {
+	return leaseFSMMsg{
+		msgType: confirmationReqOnceLeaderMsgType,
+		confirmationReqOnceLeader: confirmationReqOnceLeader{
+			shard: shard,
+		},
+	}
+}
+
 type leaseFSMMsg struct {
 	msgType leaseFSMMsgType
 	// messages
+	// external from end-customer
 	leadershipRegistrationReq leadershipRegistrationReq
 	leadershipResignationReq  leadershipResignationReq
-	leaseCreatedMsg           leaseCreatedMsg
-	leaseCloseMsg             leaseCloseMsg
+	// from election FSM
+	confirmationReqOnceLeader confirmationReqOnceLeader
+	// internal
+	leaseCreatedMsg leaseCreatedMsg
+	leaseCloseMsg   leaseCloseMsg
 }
 
 type leaseFSMMsgType uint8
@@ -95,6 +114,7 @@ const (
 	leaseCreatedMsgType
 	leaseLostMsgType
 	leadershipResignationReqMsgType
+	confirmationReqOnceLeaderMsgType
 	leaseFSMCloseMsgType
 )
 
@@ -108,6 +128,8 @@ func (l leaseFSMMsgType) String() string {
 		return "Lease Lost"
 	case leadershipResignationReqMsgType:
 		return "Leadership Resignation Request"
+	case confirmationReqOnceLeaderMsgType:
+		return "Confirmation Request after Leadership"
 	case leaseFSMCloseMsgType:
 		return "Close"
 	default:
@@ -150,4 +172,8 @@ type leadershipResignationReq struct {
 
 type leaseCloseMsg struct {
 	resp chan<- struct{}
+}
+
+type confirmationReqOnceLeader struct {
+	shard string
 }

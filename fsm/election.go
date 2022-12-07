@@ -11,13 +11,15 @@ type ElectionFSM interface {
 	Publish(electionFSMMsg)
 }
 
-func NewElectionFSM(shard string, leadershipAcquired chan<- struct{}, leadershipLost chan<- error, emdp provider.ElectionMetaDataProvider) ElectionFSM {
+func NewElectionFSM(leaseFSM LeaseFSM, shard string, leadershipAcquired chan<- struct{}, leadershipLost chan<- error, emdp provider.ElectionMetaDataProvider, isLeadershipConstrained bool) ElectionFSM {
 	result := &electionFSM{
-		shard:              shard,
-		emdp:               emdp,
-		leadershipAcquired: leadershipAcquired,
-		leadershipLost:     leadershipLost,
-		mailbox:            make(chan electionFSMMsg, 30),
+		leaseFSM:                leaseFSM,
+		shard:                   shard,
+		emdp:                    emdp,
+		isLeadershipConstrained: isLeadershipConstrained,
+		leadershipAcquired:      leadershipAcquired,
+		leadershipLost:          leadershipLost,
+		mailbox:                 make(chan electionFSMMsg, 30),
 	}
 	go result.run()
 	return result
@@ -52,6 +54,13 @@ func NewElectionCampaignRetryMsg(leaseID string) electionFSMMsg {
 	return electionFSMMsg{
 		msgType:          electionCampaignRetryMsgType,
 		campaignRetryMsg: campaignRetryMsg{leaseID: leaseID},
+	}
+}
+
+func NewLeadershipConfirmationStatusMsg(status bool) electionFSMMsg {
+	return electionFSMMsg{
+		msgType:                      leadershipConfirmationMsgType,
+		leadershipConfirmationStatus: leadershipConfirmationStatus{status: status},
 	}
 }
 
@@ -94,13 +103,14 @@ func NewElectionCloseMsg() (electionFSMMsg, <-chan struct{}) {
 type electionFSMMsg struct {
 	msgType electionFSMMsgType
 	// messages
-	registerLeaseMsg    registerLeaseMsg
-	campaignFailedMsg   campaignFailedMsg
-	campaignRetryMsg    campaignRetryMsg
-	electedLeaderMsg    electedLeaderMsg
-	captureLeaseLostMsg captureLeaseLostMsg
-	resignationReqMsg   resignationReqMsg
-	electionCloseMsg    electionCloseMsg
+	registerLeaseMsg             registerLeaseMsg
+	campaignFailedMsg            campaignFailedMsg
+	campaignRetryMsg             campaignRetryMsg
+	electedLeaderMsg             electedLeaderMsg
+	leadershipConfirmationStatus leadershipConfirmationStatus
+	captureLeaseLostMsg          captureLeaseLostMsg
+	resignationReqMsg            resignationReqMsg
+	electionCloseMsg             electionCloseMsg
 }
 
 type electionFSMMsgType uint8
@@ -110,6 +120,7 @@ const (
 	electionCampaignFailedMsgType
 	electionCampaignRetryMsgType
 	electedLeaderMsgType
+	leadershipConfirmationMsgType
 	captureLeaseLostMsgType
 	resignMsgType
 	electionCloseMsgType
@@ -121,6 +132,8 @@ func (e electionFSMMsgType) String() string {
 		return "Election Campaign Failed"
 	case electionCampaignRetryMsgType:
 		return "Election Campaign Retry"
+	case leadershipConfirmationMsgType:
+		return "Leadership Confirmation"
 	case electedLeaderMsgType:
 		return "Elected Leader"
 	case captureLeaseLostMsgType:
@@ -151,6 +164,10 @@ type campaignRetryMsg struct {
 type electedLeaderMsg struct {
 	electedAt time.Time
 	election  provider.Election
+}
+
+type leadershipConfirmationStatus struct {
+	status bool
 }
 
 type resignationReqMsg struct {

@@ -10,10 +10,10 @@ import (
 	"github.com/arunsworld/distributed/provider"
 )
 
-func NewConcurrency(appName, instanceName string, leaseProvider provider.LeaseProvider) *Concurrency {
+func NewConcurrency(appName, instanceName string, leaseProvider provider.LeaseProvider, maxLeaders int) *Concurrency {
 	emdpProvidier := emdpProvidier{appName: appName, instanceName: instanceName}
 	return &Concurrency{
-		leaseFSM: fsm.NewLeaseFSM(leaseProvider, emdpProvidier),
+		leaseFSM: fsm.NewLeaseFSM(leaseProvider, emdpProvidier, maxLeaders),
 	}
 }
 

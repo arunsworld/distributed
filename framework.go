@@ -19,10 +19,11 @@ type ProcessorOpt func(*LeadershipBasedJobProcessor)
 
 func NewLeadershipBasedJobProcessor(appName, instanceName string, leaseProvider provider.LeaseProvider, jobs []Job, opts ...ProcessorOpt) *LeadershipBasedJobProcessor {
 	result := &LeadershipBasedJobProcessor{
-		appName:       appName,
-		instanceName:  instanceName,
-		leaseProvider: leaseProvider,
-		jobs:          jobs,
+		appName:           appName,
+		instanceName:      instanceName,
+		leaseProvider:     leaseProvider,
+		jobs:              jobs,
+		maxConcurrentJobs: -1,
 	}
 	for _, o := range opts {
 		o(result)
@@ -31,10 +32,11 @@ func NewLeadershipBasedJobProcessor(appName, instanceName string, leaseProvider 
 }
 
 type LeadershipBasedJobProcessor struct {
-	appName       string
-	instanceName  string
-	leaseProvider provider.LeaseProvider
-	jobs          []Job
+	appName           string
+	instanceName      string
+	leaseProvider     provider.LeaseProvider
+	jobs              []Job
+	maxConcurrentJobs int
 	// optional
 	blockOnNoJobs    bool
 	startDelay       func(string) time.Duration
@@ -61,6 +63,12 @@ func WithVoluntaryTimeout(gen func(string) time.Duration) ProcessorOpt {
 	}
 }
 
+func WithJobQuota(maxJobs int) ProcessorOpt {
+	return func(p *LeadershipBasedJobProcessor) {
+		p.maxConcurrentJobs = maxJobs
+	}
+}
+
 func (p *LeadershipBasedJobProcessor) AddJob(j Job) {
 	p.jobs = append(p.jobs, j)
 }
@@ -77,7 +85,7 @@ func (p *LeadershipBasedJobProcessor) Execute(ctx context.Context) error {
 	if err := areJobNamesUnique(p.jobs); err != nil {
 		return err
 	}
-	dConcurrency := NewConcurrency(p.appName, p.instanceName, p.leaseProvider)
+	dConcurrency := NewConcurrency(p.appName, p.instanceName, p.leaseProvider, p.maxConcurrentJobs)
 	defer dConcurrency.Close()
 
 	if p.voluntaryTimeout != nil {

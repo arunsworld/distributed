@@ -10,10 +10,12 @@ import (
 )
 
 type electionFSM struct {
-	shard              string
-	emdp               provider.ElectionMetaDataProvider
-	leadershipAcquired chan<- struct{}
-	leadershipLost     chan<- error
+	leaseFSM                LeaseFSM
+	shard                   string
+	emdp                    provider.ElectionMetaDataProvider
+	isLeadershipConstrained bool
+	leadershipAcquired      chan<- struct{}
+	leadershipLost          chan<- error
 	// mailbox
 	mailbox chan electionFSMMsg
 	// internal state
@@ -30,6 +32,7 @@ const (
 	noLeaseForElection electionState = iota
 	electionCampaignInProgress
 	electionCampaignFailed
+	awaitingLeadershipQuotaCheck
 	electedLeader
 )
 
@@ -39,6 +42,8 @@ func (e electionState) String() string {
 		return "Campaign in Progress"
 	case electionCampaignFailed:
 		return "Campaign Failed"
+	case awaitingLeadershipQuotaCheck:
+		return "Awaiting Leadership Quota Check"
 	case electedLeader:
 		return "Elected Leader"
 	default:
@@ -75,10 +80,9 @@ func (efsm *electionFSM) run() {
 				log.Printf("WARNING: leadership election message received when campaign not in progress. Ignorning.")
 				continue
 			}
-			efsm.electedLeaderAt = msg.electedLeaderMsg.electedAt
-			efsm.election = msg.electedLeaderMsg.election
-			efsm.electionState = electedLeader
-			close(efsm.leadershipAcquired)
+			efsm.processElectedLeader(msg.electedLeaderMsg.electedAt, msg.electedLeaderMsg.election)
+		case leadershipConfirmationMsgType:
+			efsm.leadershipConfirmation(msg.leadershipConfirmationStatus.status)
 		case captureLeaseLostMsgType:
 			if efsm.processLeaseLostAndQuit() {
 				msg.captureLeaseLostMsg.discardElection <- true
@@ -141,6 +145,41 @@ func (efsm *electionFSM) processCampaignRetry(leaseID string) {
 		return
 	}
 	efsm.processElection(efsm.currentLease)
+}
+
+func (efsm *electionFSM) processElectedLeader(electedAt time.Time, election provider.Election) {
+	efsm.electedLeaderAt = electedAt
+	efsm.election = election
+	if efsm.isLeadershipConstrained {
+		efsm.electionState = awaitingLeadershipQuotaCheck
+		msg := NewConfirmationReqOnceLeader(efsm.shard)
+		go efsm.leaseFSM.Publish(msg)
+	} else {
+		efsm.electionState = electedLeader
+		close(efsm.leadershipAcquired)
+	}
+}
+
+func (efsm *electionFSM) leadershipConfirmation(status bool) {
+	if efsm.electionState != awaitingLeadershipQuotaCheck {
+		log.Printf("received leadership confirmation method but not in awaiting leadership quota check. Instead in: %s. Ignoring.", efsm.electionState)
+		return
+	}
+	if status {
+		efsm.electionState = electedLeader
+		close(efsm.leadershipAcquired)
+	} else {
+		efsm.electionState = electionCampaignFailed
+		go func(election provider.Election, leaseID string, publish func(electionFSMMsg)) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+			if err := efsm.election.Resign(ctx); err != nil {
+				log.Printf("warning: while resigning from leadership during negative confirmation encountered error: %v", err)
+			}
+			cancel()
+			time.Sleep(time.Second * 5)
+			publish(NewElectionCampaignRetryMsg(leaseID))
+		}(efsm.election, efsm.currentLease.ID(), efsm.Publish)
+	}
 }
 
 func (efsm *electionFSM) processLeaseLostAndQuit() bool {

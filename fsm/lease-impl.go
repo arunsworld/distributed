@@ -9,13 +9,15 @@ import (
 )
 
 type leaseFSM struct {
-	provider provider.LeaseProvider
-	emdp     provider.ElectionMetaDataProvider
+	provider   provider.LeaseProvider
+	emdp       provider.ElectionMetaDataProvider
+	maxLeaders int
 	// mailbox
 	mailbox chan leaseFSMMsg // change to etcd free message type laster
 	// internal state
 	leaseState            leaseState
 	shards                map[string]ElectionFSM
+	leaders               map[string]struct{}
 	lease                 provider.Lease
 	cancelLeaseAquisition context.CancelFunc
 }
@@ -45,6 +47,7 @@ func (lsfm *leaseFSM) Publish(msg leaseFSMMsg) {
 
 func (lsfm *leaseFSM) run() {
 	lsfm.shards = make(map[string]ElectionFSM)
+	lsfm.leaders = make(map[string]struct{})
 	for msg := range lsfm.mailbox {
 		startingState := lsfm.leaseState
 		switch msg.msgType {
@@ -65,6 +68,9 @@ func (lsfm *leaseFSM) run() {
 		case leadershipResignationReqMsgType:
 			req := msg.leadershipResignationReq
 			req.resp <- lsfm.resignLeadership(req.ctx, req.shard)
+		case confirmationReqOnceLeaderMsgType:
+			req := msg.confirmationReqOnceLeader
+			lsfm.processConfirmationReqOnceLeader(req.shard)
 		case leaseFSMCloseMsgType:
 			lsfm.processClose()
 			close(msg.leaseCloseMsg.resp)
@@ -83,7 +89,7 @@ func (lsfm *leaseFSM) processLeadershipRegistrationReq(shard string) leadershipR
 	}
 	leadershipAcquired := make(chan struct{})
 	leadershipLost := make(chan error, 1) // add some buffer in case caller doesn't read this channel
-	electionFSM := NewElectionFSM(shard, leadershipAcquired, leadershipLost, lsfm.emdp)
+	electionFSM := NewElectionFSM(lsfm, shard, leadershipAcquired, leadershipLost, lsfm.emdp, lsfm.isLeadershipConstrained())
 	lsfm.shards[shard] = electionFSM
 
 	switch lsfm.leaseState {
@@ -127,6 +133,7 @@ func (lsfm *leaseFSM) deactivateShardsDueToLeaseLoss() {
 		s.Publish(msg)
 		if <-resp {
 			delete(lsfm.shards, name)
+			delete(lsfm.leaders, name)
 		}
 	}
 }
@@ -141,6 +148,7 @@ func (lsfm *leaseFSM) resignLeadership(ctx context.Context, shard string) error 
 	resp := <-_resp
 	if resp.DiscardElection() {
 		delete(lsfm.shards, shard)
+		delete(lsfm.leaders, shard)
 	}
 	return resp.Err()
 }
@@ -163,6 +171,24 @@ func (lsfm *leaseFSM) processClose() {
 		<-resp
 	}
 	lsfm.lease.Close()
+}
+
+func (lsfm *leaseFSM) processConfirmationReqOnceLeader(shard string) {
+	status := false
+	if !lsfm.isLeadershipQuotaFull() {
+		status = true
+		lsfm.leaders[shard] = struct{}{}
+	}
+	msg := NewLeadershipConfirmationStatusMsg(status)
+	go lsfm.shards[shard].Publish(msg)
+}
+
+func (lsfm *leaseFSM) isLeadershipConstrained() bool {
+	return lsfm.maxLeaders > -1
+}
+
+func (lsfm *leaseFSM) isLeadershipQuotaFull() bool {
+	return !(len(lsfm.leaders) < lsfm.maxLeaders)
 }
 
 func acquireLease(ctx context.Context, provider provider.LeaseProvider, publish func(leaseFSMMsg)) {

@@ -18,7 +18,7 @@ func Test_NewConcurrency(t *testing.T) {
 		// Given
 		leaseCreationTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		// When
 		c.RegisterLeadershipRequest("jobA")
 		c.RegisterLeadershipRequest("jobB")
@@ -39,7 +39,7 @@ func Test_NewConcurrency(t *testing.T) {
 		leaseCreationTrigger := make(chan struct{})
 		leaseTimeoutTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger, leaseTimeoutTrigger: leaseTimeoutTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		// When
 		c.RegisterLeadershipRequest("jobA")
 		leaseCreationTrigger <- struct{}{}
@@ -57,7 +57,7 @@ func Test_NewConcurrency(t *testing.T) {
 		// Given
 		leaseCreationTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		close(leaseCreationTrigger) // whenever lease creation is desired it will succeed
 		// When
 		leadershipAcquired, _, _ := c.RegisterLeadershipRequest("jobA")
@@ -74,7 +74,7 @@ func Test_NewConcurrency(t *testing.T) {
 		// Given
 		leaseCreationTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		close(leaseCreationTrigger) // whenever lease creation is desired it will succeed
 		// And
 		leadershipAcquired, _, _ := c.RegisterLeadershipRequest("jobA")
@@ -94,7 +94,7 @@ func Test_NewConcurrency(t *testing.T) {
 		// Given
 		leaseCreationTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		close(leaseCreationTrigger) // whenever lease creation is desired it will succeed
 		// And
 		// first job - leader
@@ -119,7 +119,7 @@ func Test_NewConcurrency(t *testing.T) {
 		leaseCreationTrigger := make(chan struct{})
 		leaseTimeoutTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger, leaseTimeoutTrigger: leaseTimeoutTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		close(leaseCreationTrigger) // whenever lease creation is desired it will succeed
 		// And
 		leadershipAcquired, leadershipLost, _ := c.RegisterLeadershipRequest("jobA")
@@ -138,7 +138,7 @@ func Test_NewConcurrency(t *testing.T) {
 		ct := make(chan struct{})
 		close(ct) // campaign should trigger whenever desired
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger, electionErrorUntil: 1, campaignTrigger: ct}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		// And
 		leadershipAcquired, _, _ := c.RegisterLeadershipRequest("jobA")
 		time.Sleep(time.Millisecond) // give it a bit of propagation time
@@ -152,7 +152,7 @@ func Test_NewConcurrency(t *testing.T) {
 		ct := make(chan struct{}, 10)
 		// close(ct) // campaign should trigger whenever desired
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger, leaseTimeoutTrigger: leaseTimeoutTrigger, campaignTrigger: ct, electionErrorUntil: 3}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		// And then lease expires; but subsequent campaign is good
 		leadershipAcquired, _, _ := c.RegisterLeadershipRequest("jobA")
 		time.Sleep(time.Millisecond) // give it a bit of propagation time
@@ -168,7 +168,7 @@ func Test_NewConcurrency(t *testing.T) {
 		// Given
 		leaseCreationTrigger := make(chan struct{})
 		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger}
-		c := distributed.NewConcurrency("testApp", "node1", provider)
+		c := distributed.NewConcurrency("testApp", "node1", provider, -1)
 		// When
 		wg := sync.WaitGroup{}
 		for i := 0; i < 500; i++ {
@@ -182,6 +182,35 @@ func Test_NewConcurrency(t *testing.T) {
 			}(i)
 		}
 		wg.Wait()
+	})
+	t.Run("able to limit the number of concurrent jobs on node", func(t *testing.T) {
+		// Given
+		leaseCreationTrigger := make(chan struct{})
+		close(leaseCreationTrigger) // create lease immediately upon request
+		cp := make(chan struct{})
+		close(cp) // campaigns should immediately result in leaders
+		provider := &testLeaseProvider{leaseCreationTrigger: leaseCreationTrigger, campaignTrigger: cp}
+		c := distributed.NewConcurrency("testApp", "node1", provider, 50)
+		allJobs := make([]<-chan struct{}, 0, 100)
+		for i := 0; i < 100; i++ {
+			la, _, err := c.RegisterLeadershipRequest(fmt.Sprintf("job-%d", i))
+			if err != nil {
+				panic(err)
+			}
+			allJobs = append(allJobs, la)
+		}
+		time.Sleep(time.Millisecond * 100) // enough time to propagate leadership
+		numberOfLeaders := 0
+		for _, al := range allJobs {
+			select {
+			case <-al:
+				numberOfLeaders++
+			default:
+			}
+		}
+		if numberOfLeaders != 50 {
+			t.Fatalf("expected leaders to be limited to 50, got: %d", numberOfLeaders)
+		}
 	})
 }
 
