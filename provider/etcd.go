@@ -13,10 +13,10 @@ import (
 
 type ETCDOption func(*etcdLeaseProvider)
 
+// etcd backed LeaseProvider
 func NewETCDLeaseProvider(etcdEndPoints []string, options ...ETCDOption) LeaseProvider {
 	result := &etcdLeaseProvider{
 		etcdEndPoints: etcdEndPoints,
-		leaseTTL:      10,
 		config:        etcd.Config{Endpoints: etcdEndPoints},
 	}
 	for _, o := range options {
@@ -60,16 +60,28 @@ func (p *etcdLeaseProvider) AcquireLease(ctx context.Context) (Lease, error) {
 		p.currentLease = nil
 	}
 
+	// we need a context to pass to the session that gets cancelled if ctx is cancelled during session creation
+	// to avoid blocking on session creation if an application is trying to stop
+	// however, once the session is created, the session context should NOT react to ctx
+	// otherwise it will interfere with clean-up operations like Resign and Close
 	actx, abortMonitoring := NewAbortableMonitoredContext(ctx)
 	var client *etcd.Client
 	var session *concurrency.Session
 	for {
 		var err error
-		client, err = etcd.New(p.config)
-		if err != nil {
-			return nil, fmt.Errorf("error creating a new etcd client: %v", err)
-		}
-		session, err = concurrency.NewSession(client, concurrency.WithContext(actx), concurrency.WithTTL(p.leaseTTL))
+		func() {
+			client, err = etcd.New(p.config)
+			if err != nil {
+				err = fmt.Errorf("error creating a new etcd client: %v", err)
+				return
+			}
+			session, err = concurrency.NewSession(client, concurrency.WithContext(actx), concurrency.WithTTL(p.leaseTTL))
+			if err != nil {
+				err = fmt.Errorf("error creating a new session: %v", err)
+			}
+		}()
+		// we will get an error if an operation fails (even for context cancellation)
+		// therefore, absence of error indicates successful lease acquisition
 		if err == nil {
 			break
 		}
@@ -78,13 +90,14 @@ func (p *etcdLeaseProvider) AcquireLease(ctx context.Context) (Lease, error) {
 			return nil, fmt.Errorf("context cancelled")
 		default:
 		}
-		log.Printf("error creating new session while attempting to aquire lease: %v", err)
+		log.Printf("transient error in etcd AcquireLease: %v", err)
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("context cancelled")
 		case <-time.After(time.Second):
 		}
 	}
+	// now that we have a valid session, we no longer need it to reacht to ctx
 	abortMonitoring()
 
 	return &etcdLease{

@@ -5,8 +5,15 @@ import (
 	"time"
 )
 
+// A LeaseProvider implementation is backed by a remote endpoint used to implement a distributed lock.
+// It facilitates the acquisition of a Lease that indicates liveness of the client as well as the server.
+// The LeaseProvider should continuously renew it's lease before expiration via a heartbeat of some sort.
+// From a client perspective if the remote endpoint is no longer available or for other reasons indicated by the server,
+// an acquired lease should be expired.
+// From a server perspective if a lease exprires, other lease holders can acquire locks previously held by the expiring lease holder.
 type LeaseProvider interface {
-	// if context is cancelled, return an error; otherwise expected to block forever until lease is acquired
+	// if context is cancelled, return an error; otherwise block forever until lease is acquired
+	// returning before a lease is acquired and the context still active will be considered a bugs
 	AcquireLease(context.Context) (Lease, error)
 }
 
